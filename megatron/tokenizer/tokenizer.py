@@ -42,6 +42,9 @@ def build_tokenizer(args):
     elif args.tokenizer_type == 'NullTokenizer':
         assert args.vocab_size is not None
         tokenizer = _NullTokenizer(args.vocab_size)
+    elif args.tokenizer_type == "HuggingFaceTokenizer":
+        assert args.tokenizer_model is not None
+        tokenizer = _HuggingFaceTokenizer(args.tokenizer_model)
     else:
         raise NotImplementedError('{} tokenizer is not '
                                   'implemented.'.format(args.tokenizer_type))
@@ -538,3 +541,34 @@ class _NullTokenizer:
     @property
     def additional_special_tokens_ids(self):
         return None
+
+class _HuggingFaceTokenizer(AbstractTokenizer):
+    def __init__(self, model_path):
+        from transformers import AutoTokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, use_auth_token=True)
+
+    def tokenize(self, text):
+        return self.tokenizer.encode(text)
+
+    def detokenize(self, ids):
+        return self.tokenizer.decode(ids)
+
+    @property
+    def cls(self):
+        return self.tokenizer.cls_token_id
+
+    @property
+    def sep(self):
+        return self.tokenizer.sep_token_id
+
+    @property
+    def mask(self):
+        return self.tokenizer.mask_token_id
+
+    @property
+    def eod(self):
+        return self.tokenizer.eos_token_id
+
+    @property
+    def additional_special_tokens_ids(self):
+        return self.tokenizer.all_special_ids

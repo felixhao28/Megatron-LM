@@ -36,7 +36,7 @@ def model_provider(pre_process=True, post_process=True):
 def get_batch(data_iterator):
     """Generate a batch"""
     args = get_args()
-    # tokenizer = get_tokenizer()
+    tokenizer = get_tokenizer()
 
     # Items and their type.
     keys = ['text']
@@ -57,7 +57,7 @@ def get_batch(data_iterator):
     # Get the masks and postition ids.
     attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
         tokens,
-        0, #tokenizer.eod,
+        tokenizer.eod,
         args.reset_position_ids,
         args.reset_attention_mask,
         args.eod_mask_loss)
@@ -133,4 +133,4 @@ if __name__ == "__main__":
              model_provider,
              ModelType.encoder_or_decoder,
              forward_step,
-             args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
+             args_defaults={'tokenizer_type': 'NullTokenizer'})
