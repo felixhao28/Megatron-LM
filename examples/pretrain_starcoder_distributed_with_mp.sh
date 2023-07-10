@@ -52,6 +52,8 @@ GPT_ARGS="
     --no-strict-load \
     --hidden-dropout=0 \
     --attention-dropout=0 \
+    --tokenizer-type=HuggingFaceTokenizer \
+    --tokenizer-model=/data3/StarCoderBase\
 "
 
 DATA_ARGS="
