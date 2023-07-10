@@ -18,6 +18,7 @@ from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.core.models.common.rotary_pos_embedding import apply_rotary_pos_emb
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
+from megatron.logging import log_tensor_aix
 
 try:
     from einops import rearrange
@@ -37,6 +38,7 @@ except ImportError:
      np: n/p
      hp: h/p
      hn: h/n
+     hnp: h/n/p (Only used with multi-query, because hn is splited across partitions during key-value projection)
      b: batch size
      s: sequence length
      l: number of layers
@@ -197,7 +199,7 @@ class SwitchMLP(MegatronModule):
 class CoreAttention(MegatronModule):
 
     def __init__(self, layer_number, config,
-                 attn_mask_type=AttnMaskType.padding):
+                 attn_mask_type=AttnMaskType.padding, multi_query=False):
         super(CoreAttention, self).__init__()
         self.fp16 = config.fp16
         self.bf16 = config.bf16
@@ -240,6 +242,8 @@ class CoreAttention(MegatronModule):
         # on average it should not be partition dependent.
         self.attention_dropout = torch.nn.Dropout(config.attention_dropout)
 
+        self.multi_query = multi_query
+
     def forward(self, query_layer, key_layer,
                 value_layer, attention_mask):
 
@@ -252,25 +256,51 @@ class CoreAttention(MegatronModule):
                        query_layer.size(2),
                        query_layer.size(0),
                        key_layer.size(0))
+        b, np, sq, sk = output_size
 
-        # [sq, b, np, hn] -> [sq, b * np, hn]
-        query_layer = query_layer.view(output_size[2],
-                                       output_size[0] * output_size[1], -1)
-        # [sk, b, np, hn] -> [sk, b * np, hn]
-        key_layer = key_layer.view(output_size[3],
-                                   output_size[0] * output_size[1], -1)
+        if self.multi_query:
+            # [sq, b, np, hn] -> [b, sq, np, hn]
+            query_layer = query_layer.transpose(0, 1)
+            # [sq, b, np, hn] -> [b, sq * np, hn]
+            query_layer = query_layer.view(b, sq * np, -1)
+            # [sk, b, 1, hn] -> [sk, b, hn]
+            key_layer = key_layer.view(sk, b, -1)
+            # [sk, b, hn] -> [b, hn, sk]
+            key_layer = key_layer.transpose(0, 1).transpose(1, 2)
 
-        # preallocting input tensor: [b * np, sq, sk]
-        matmul_input_buffer = mpu.get_global_memory_buffer().get_tensor(
-            (output_size[0]*output_size[1], output_size[2], output_size[3]),
-            query_layer.dtype, "mpu")
+            # preallocting input tensor: [b, sq * np, sk]
+            matmul_input_buffer = mpu.get_global_memory_buffer().get_tensor(
+                (b, sq * np, sk),
+                query_layer.dtype, "mpu")
+        else:
+            # [sq, b, np, hn] -> [sq, b * np, hn]
+            query_layer = query_layer.view(output_size[2],
+                                        output_size[0] * output_size[1], -1)
+            # [sq, b * np, hn] -> [b * np, sq, hn]
+            query_layer = query_layer.transpose(0, 1)
+            # [sk, b, np, hn] -> [sk, b * np, hn]
+            key_layer = key_layer.view(output_size[3],
+                                    output_size[0] * output_size[1], -1)
+            # [sk, b * np, hn] -> [b * np, hn, sk]
+            key_layer = key_layer.transpose(0, 1).transpose(1, 2)
 
-        # Raw attention scores. [b * np, sq, sk]
+            # preallocting input tensor: [b * np, sq, sk]
+            matmul_input_buffer = mpu.get_global_memory_buffer().get_tensor(
+                (output_size[0]*output_size[1], output_size[2], output_size[3]),
+                query_layer.dtype, "mpu")
+
+        # Raw attention scores. MHA: [b * np, sq, sk] MQA: [b, sq * np, sk]
         matmul_result = torch.baddbmm(
             matmul_input_buffer,
-            query_layer.transpose(0, 1),   # [b * np, sq, hn]
-            key_layer.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
+            query_layer,   # MHA: [b * np, sq, hn] MQA: [b, sq * np, hn]
+            key_layer,     # MHA: [b * np, hn, sk] MQA: [b, hn, sk]
             beta=0.0, alpha=(1.0/self.norm_factor))
+
+        if self.multi_query:
+            # [b, sq * np, sk] -> [b, sq, np, sk]
+            matmul_result = matmul_result.view(b, sq, np, sk)
+            # [b, sq, np, sk] -> [b, np, sq, sk]
+            matmul_result = matmul_result.transpose(1, 2)
 
         # change view to [b, np, sq, sk]
         attention_scores = matmul_result.view(*output_size)
@@ -300,19 +330,24 @@ class CoreAttention(MegatronModule):
 
         # context layer shape: [b, np, sq, hn]
         output_size = (value_layer.size(1),
-                       value_layer.size(2),
-                       query_layer.size(0),
+                       np,
+                       sq,
                        value_layer.size(3))
 
         # change view [sk, b * np, hn]
         value_layer = value_layer.view(value_layer.size(0),
-                                       output_size[0] * output_size[1], -1)
+                                       value_layer.size(1) * value_layer.size(2), -1)
 
-        # change view [b * np, sq, sk]
-        attention_probs = attention_probs.view(output_size[0] * output_size[1],
-                                               output_size[2], -1)
+        if self.multi_query:
+            # change view [b, np * sq, sk]
+            attention_probs = attention_probs.view(output_size[0], output_size[1] *
+                                                output_size[2], -1)
+        else:
+            # change view [b * np, sq, sk]
+            attention_probs = attention_probs.view(output_size[0] * output_size[1],
+                                                output_size[2], -1)
 
-        # matmul: [b * np, sq, hn]
+        # matmul: MQA: [b, np * sq, hn] MHA: [b * np, sq, hn]
         context_layer = torch.bmm(attention_probs, value_layer.transpose(0, 1))
 
         # change view [b, np, sq, hn]
@@ -431,16 +466,40 @@ class ParallelAttention(MegatronModule):
             projection_size, config.num_attention_heads)
         self.num_attention_heads_per_partition = core.utils.divide(
             config.num_attention_heads, world_size)
+        self.multi_query = args.multi_query
 
         # Strided linear layer.
         if attention_type == AttnType.self_attn:
-            self.query_key_value = tensor_parallel.ColumnParallelLinear(
-                config.hidden_size,
-                3 * projection_size,
-                config=config,
-                init_method=config.init_method,
-                bias=args.add_bias_linear,
-                gather_output=False)
+            if self.multi_query:
+                self.query = tensor_parallel.ColumnParallelLinear(
+                    config.hidden_size,
+                    projection_size,
+                    config=config,
+                    init_method=config.init_method,
+                    bias=args.add_bias_linear,
+                    gather_output=False)
+                # 我不确定这是不是个好主意，因为hn在starcoder里面也就是 6144/48=128
+                # 把一个 6144 * 256 的小矩阵做模型并行可能意义不大，但影响应该也不大
+                self.key_value = tensor_parallel.ColumnParallelLinear(
+                    config.hidden_size,
+                    2 * self.hidden_size_per_attention_head, # 2 * 128
+                    config=config,
+                    init_method=config.init_method,
+                    bias=args.add_bias_linear,
+                    gather_output=True)
+                self.key_value_hidden_size_per_partition = core.utils.divide(
+                    self.hidden_size_per_attention_head, world_size)
+                
+                self.num_attention_heads_per_partition = core.utils.divide(
+                    config.num_attention_heads, world_size)
+            else:
+                self.query_key_value = tensor_parallel.ColumnParallelLinear(
+                    config.hidden_size,
+                    3 * projection_size,
+                    config=config,
+                    init_method=config.init_method,
+                    bias=args.add_bias_linear,
+                    gather_output=False)
         else:
             assert attention_type == AttnType.cross_attn
             self.query = tensor_parallel.ColumnParallelLinear(
@@ -461,7 +520,7 @@ class ParallelAttention(MegatronModule):
                 gather_output=False)
 
         self.core_attention = CoreAttention(self.layer_number, config,
-                                            self.attn_mask_type)
+                                            self.attn_mask_type, self.multi_query)
         self.checkpoint_core_attention = config.recompute_granularity == 'selective'
 
         if self.use_flash_attn:
@@ -540,19 +599,45 @@ class ParallelAttention(MegatronModule):
         # =====================
 
         if self.attention_type == AttnType.self_attn:
-            # Attention heads [sq, b, h] --> [sq, b, (np * 3 * hn)]
-            mixed_x_layer, _ = self.query_key_value(hidden_states)
+            if self.multi_query:
+                # Attention heads [sk, b, h] --> [sk, b, (2 * hn)]
+                # print(f"hidden_states.shape={hidden_states.shape}")
+                # print(f"self.key_value.shape={self.key_value.weight.shape}")
+                mixed_kv_layer, _ = self.key_value(hidden_states)
+                # print(f"mixed_kv_layer.shape={mixed_kv_layer.shape}")
 
-            # [sq, b, (np * 3 * hn)] --> [sq, b, np, 3 * hn]
-            new_tensor_shape = mixed_x_layer.size()[:-1] + \
-                (self.num_attention_heads_per_partition,
-                 3 * self.hidden_size_per_attention_head)
-            mixed_x_layer = mixed_x_layer.view(*new_tensor_shape)
+                # [sk, b, (2 * hn)] --> [sk, b, 1, 2 * hn]
+                new_tensor_shape = mixed_kv_layer.size()[:-1] + \
+                    (1,
+                    2 * self.hidden_size_per_attention_head)
+                # print(f"new_tensor_shape={new_tensor_shape}")
+                mixed_kv_layer = mixed_kv_layer.view(*new_tensor_shape)
 
-            # [sq, b, np, 3 * hn] --> 3 [sq, b, np, hn]
-            (query_layer,
-             key_layer,
-             value_layer) = tensor_parallel.split_tensor_along_last_dim(mixed_x_layer, 3)
+                # [sk, b, 1, 2 * hnp] --> 2 [sk, b, 1, hnp]
+                (key_layer,
+                value_layer) = tensor_parallel.split_tensor_along_last_dim(mixed_kv_layer, 2)
+
+                # Attention head [sq, b, h] --> [sq, b, hp]
+                query_layer, _ = self.query(hidden_states)
+                # [sq, b, hp] --> [sq, b, np, hn]
+                new_tensor_shape = query_layer.size()[:-1] + \
+                    (self.num_attention_heads_per_partition,
+                    self.hidden_size_per_attention_head)
+                query_layer = query_layer.view(*new_tensor_shape)
+            else:
+                # Attention heads [sq, b, h] --> [sq, b, (np * 3 * hn)]
+                mixed_x_layer, _ = self.query_key_value(hidden_states)
+
+                # [sq, b, (np * 3 * hn)] --> [sq, b, np, 3 * hn]
+                new_tensor_shape = mixed_x_layer.size()[:-1] + \
+                    (self.num_attention_heads_per_partition,
+                    3 * self.hidden_size_per_attention_head)
+                mixed_x_layer = mixed_x_layer.view(*new_tensor_shape)
+
+                # [sq, b, np, 3 * hn] --> 3 [sq, b, np, hn]
+                (query_layer,
+                key_layer,
+                value_layer) = tensor_parallel.split_tensor_along_last_dim(mixed_x_layer, 3)
         else:
             # Attention heads [sk, b, h] --> [sk, b, (np * 2 * hn)]
             mixed_kv_layer, _ = self.key_value(encoder_output)
@@ -719,6 +804,7 @@ class ParallelTransformerLayer(MegatronModule):
 
         self.bf16 = config.bf16
         self.fp32_residual_connection = config.fp32_residual_connection
+        self.sequence_parallel = config.sequence_parallel
 
         # Layernorm on the input data.
         self.input_layernorm = LayerNorm(
@@ -1013,8 +1099,10 @@ class ParallelTransformerLayer(MegatronModule):
                 rotary_pos_emb=None):
         # hidden_states: [s, b, h]
 
+        log_tensor_aix(hidden_states, f"{self.layer_number} hidden_states", sequence_parallel=self.sequence_parallel)
         # Layer norm at the beginning of the transformer layer.
         layernorm_output = self.input_layernorm(hidden_states)
+        log_tensor_aix(layernorm_output, f"{self.layer_number} ln(hidden_states)", sequence_parallel=self.sequence_parallel)
 
         # Self attention.
         attention_output, attention_bias = \
@@ -1023,6 +1111,8 @@ class ParallelTransformerLayer(MegatronModule):
                 attention_mask,
                 inference_params=inference_params,
                 rotary_pos_emb=rotary_pos_emb)
+
+        log_tensor_aix(attention_output, f"{self.layer_number} attn_output", bias=attention_bias, sequence_parallel=self.sequence_parallel)
 
         # Residual connection.
         if self.apply_residual_connection_post_layernorm:
@@ -1057,8 +1147,10 @@ class ParallelTransformerLayer(MegatronModule):
                                               training=self.training)
             layernorm_input = residual + self.drop_path(out)
 
+        log_tensor_aix(layernorm_input, f"{self.layer_number} hidden_states with residual", sequence_parallel=self.sequence_parallel)
         # Layer norm post the self attention.
         layernorm_output = self.post_attention_layernorm(layernorm_input)
+        log_tensor_aix(layernorm_output, f"{self.layer_number} ln(hidden_states with residual)", sequence_parallel=self.sequence_parallel)
 
         # Cross attention.
         if self.layer_type == LayerType.encoder:
@@ -1095,6 +1187,7 @@ class ParallelTransformerLayer(MegatronModule):
 
         # MLP.
         mlp_output, mlp_bias = self.mlp(layernorm_output)
+        log_tensor_aix(mlp_output, f"{self.self_attention.layer_number} feed_forward_hidden_states", bias=mlp_bias, sequence_parallel=self.sequence_parallel)
 
         # Second residual connection.
         if self.apply_residual_connection_post_layernorm:
@@ -1130,6 +1223,7 @@ class ParallelTransformerLayer(MegatronModule):
                                               training=self.training)
             output = residual + self.drop_path(out)
 
+        log_tensor_aix(output, f"{self.layer_number} output", sequence_parallel=self.sequence_parallel)
         if self.layer_type == LayerType.retro_decoder_with_retriever:
             return output, retriever_output
         else:
@@ -1637,8 +1731,10 @@ class ParallelTransformer(MegatronModule):
                 if torch.is_grad_enabled() and self.training:
                     self.microbatch_count += 1
 
+        log_tensor_aix(hidden_states, "transformers output", sequence_parallel=self.sequence_parallel)
         # Final layer norm.
         if self.post_process and self.post_layer_norm:
             hidden_states = self.final_layernorm(hidden_states)
+        log_tensor_aix(hidden_states, "ln(hidden_states)", sequence_parallel=self.sequence_parallel)
 
         return hidden_states

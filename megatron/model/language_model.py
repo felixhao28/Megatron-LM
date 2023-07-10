@@ -15,7 +15,7 @@ from .module import MegatronModule
 from .transformer import ParallelTransformer
 from .utils import get_linear_layer
 from .utils import init_method_normal, scaled_init_method_normal
-
+from megatron.logging import log_tensor_aix
 
 def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
                        bias=None):
@@ -358,6 +358,7 @@ class TransformerLanguageModel(MegatronModule):
         self.encoder_hidden_state = None
         self.add_retriever = args.retro_add_retriever
         self.untie_embeddings_and_output_weights = args.untie_embeddings_and_output_weights
+        self.sequence_parallel = config.sequence_parallel
 
         # Embeddings.
         if self.pre_process:
@@ -468,6 +469,8 @@ class TransformerLanguageModel(MegatronModule):
                 pooling_sequence_index=0,
                 enc_hidden_states=None, output_enc_hidden=False):
 
+        log_tensor_aix(enc_input_ids, "enc_input_ids", only_on_rank_0=True)
+        log_tensor_aix(enc_position_ids, "enc_position_ids", only_on_rank_0=True)
         # Encoder embedding.
         if self.pre_process:
             encoder_input = self.embedding(enc_input_ids, enc_position_ids,
@@ -482,6 +485,7 @@ class TransformerLanguageModel(MegatronModule):
                                              tokentype_ids=tokentype_ids)
         else:
             retriever_input = None
+        log_tensor_aix(encoder_input, "inputs_embeds + position_embeds", sequence_parallel=self.sequence_parallel)
 
         # Rotary positional embeddings
         rotary_pos_emb = None
@@ -512,6 +516,7 @@ class TransformerLanguageModel(MegatronModule):
                 pooled_output = self.pooler(encoder_output,
                                             pooling_sequence_index)
 
+        # raise Exception("manual stop after one step")
         # output_enc_hidden refers to when we just need the encoder's
         # output. For example, it is helpful to compute
         # similarity between two sequences by average pooling

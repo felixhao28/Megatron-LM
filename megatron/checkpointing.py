@@ -14,6 +14,7 @@ from megatron.core import mpu, tensor_parallel
 from .global_vars import get_args
 from .utils import (unwrap_model,
                     print_rank_0)
+from .logging import print_with_rank
 
 
 _CHECKPOINT_VERSION = None
@@ -287,7 +288,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
         torch.distributed.barrier()
 
 
-def _transpose_first_dim(t, num_splits, num_splits_first, model):
+def _transpose_first_dim(t, num_splits, num_splits_first, model, is_key_query=False):
     input_shape = t.size()
     # We use a self_attention module but the values extracted aren't
     # specific to self attention so should work for cross attention as well
@@ -295,33 +296,54 @@ def _transpose_first_dim(t, num_splits, num_splits_first, model):
         model = model.module
     attention_module = model.language_model.encoder.layers[0].self_attention
     hidden_size_per_attention_head = attention_module.hidden_size_per_attention_head
-    num_attention_heads_per_partition = attention_module.num_attention_heads_per_partition
-    if num_splits_first:
-        """[num_splits * np * hn, h]
-        -->(view) [num_splits, np, hn, h]
-        -->(tranpose) [np, num_splits, hn, h]
-        -->(view) [np * num_splits * hn, h] """
+    # num_attention_heads_per_partition = attention_module.num_attention_heads_per_partition
+    if is_key_query and attention_module.multi_query:
+        if num_splits_first:
+            """[num_splits * 1 * hnp, h]
+            -->(view) [num_splits, 1, hnp, h]
+            -->(tranpose) [1, num_splits, hnp, h]
+            -->(view) [1 * num_splits * hnp, h] """
+            pass
+        else:
+            """[1 * hnp * num_splits, h]
+            -->(view) [1, hnp, num_splits, h]
+            -->(tranpose) [1, num_splits, hnp, h]
+            -->(view) [1 * num_splits * hnp, h] """
+            intermediate_shape = \
+                (1,
+                hidden_size_per_attention_head // num_splits, num_splits) +\
+                input_shape[1:]
 
-        intermediate_shape = \
-            (num_splits, num_attention_heads_per_partition,
-             hidden_size_per_attention_head) + input_shape[1:]
-
-        t = t.view(*intermediate_shape)
-        t = t.transpose(0, 1).contiguous()
+            t = t.view(*intermediate_shape)
+            t = t.transpose(1, 2).contiguous()
     else:
-        """[np * hn * num_splits, h]
-        -->(view) [np, hn, num_splits, h]
-        -->(tranpose) [np, num_splits, hn, h]
-        -->(view) [np * num_splits * hn, h] """
+        num_attention_heads_per_partition = input_shape[0] // (num_splits * hidden_size_per_attention_head)
+        if num_splits_first:
+            """[num_splits * np * hn, h]
+            -->(view) [num_splits, np, hn, h]
+            -->(tranpose) [np, num_splits, hn, h]
+            -->(view) [np * num_splits * hn, h] """
 
-        intermediate_shape = \
-            (num_attention_heads_per_partition,
-             hidden_size_per_attention_head, num_splits) +\
-             input_shape[1:]
+            intermediate_shape = \
+                (num_splits, num_attention_heads_per_partition,
+                hidden_size_per_attention_head) + input_shape[1:]
 
-        t = t.view(*intermediate_shape)
-        t = t.transpose(1, 2).contiguous()
-    t = t.view(*input_shape)
+            t = t.view(*intermediate_shape)
+            t = t.transpose(0, 1).contiguous()
+        else:
+            """[np * hn * num_splits, h]
+            -->(view) [np, hn, num_splits, h]
+            -->(tranpose) [np, num_splits, hn, h]
+            -->(view) [np * num_splits * hn, h] """
+
+            intermediate_shape = \
+                (num_attention_heads_per_partition,
+                hidden_size_per_attention_head, num_splits) +\
+                input_shape[1:]
+
+            t = t.view(*intermediate_shape)
+            t = t.transpose(1, 2).contiguous()
+        t = t.view(*input_shape)
 
     return t
 
@@ -346,9 +368,9 @@ def fix_query_key_value_ordering(model, checkpoint_version):
                 param.data.copy_(fixed_param)
             if name.endswith(('.key_value.weight', '.key_value.bias')):
                 if checkpoint_version == 0:
-                    fixed_param = _transpose_first_dim(param.data, 2, True, model)
+                    fixed_param = _transpose_first_dim(param.data, 2, True, model, is_key_query=True)
                 elif checkpoint_version == 1.0:
-                    fixed_param = _transpose_first_dim(param.data, 2, False, model)
+                    fixed_param = _transpose_first_dim(param.data, 2, False, model, is_key_query=True)
                 else:
                     print_rank_0(f"Invalid checkpoint version {checkpoint_version}.")
                     sys.exit()
@@ -362,35 +384,40 @@ def _load_base_checkpoint(load_dir, rank0=False):
 
     If rank0 is true, just loads rank 0 checkpoint, ignoring arguments.
     """
-
-    # Read the tracker file and set the iteration.
-    tracker_filename = get_checkpoint_tracker_filename(load_dir)
-
-    # If no tracker file, return nothing
-    if not os.path.isfile(tracker_filename):
-        if not rank0:
-            print_rank_0('WARNING: could not find the metadata file {} '.format(
-                tracker_filename))
-            print_rank_0('    will not load any checkpoints and will start from '
-                         'random')
-        return None, "", False
-
-    # Otherwise, read the tracker file and either set the iteration or
-    # mark it as a release checkpoint.
-    iteration, release = read_metadata(tracker_filename)
-
-    # Checkpoint.
-    if rank0:
-        checkpoint_name = find_checkpoint_rank_0(load_dir, iteration, release)
+    if os.path.isfile(load_dir) and load_dir.endswith(".pt"):
+        iteration, release = 0, True
+        checkpoint_name = load_dir
     else:
-        checkpoint_name = get_checkpoint_name(load_dir, iteration, release)
-        if release:
-            print_rank_0(f' loading release checkpoint from {load_dir}')
+
+        # Read the tracker file and set the iteration.
+        tracker_filename = get_checkpoint_tracker_filename(load_dir)
+
+        # If no tracker file, return nothing
+        if not os.path.isfile(tracker_filename):
+            if not rank0:
+                print_rank_0('WARNING: could not find the metadata file {} '.format(
+                    tracker_filename))
+                print_rank_0('    will try loading release version')
+            iteration, release = 0, True
         else:
-            print_rank_0(f' loading checkpoint from {load_dir} at iteration {iteration}')
+
+            # Otherwise, read the tracker file and either set the iteration or
+            # mark it as a release checkpoint.
+            iteration, release = read_metadata(tracker_filename)
+
+        # Checkpoint.
+        if rank0:
+            checkpoint_name = find_checkpoint_rank_0(load_dir, iteration, release)
+        else:
+            checkpoint_name = get_checkpoint_name(load_dir, iteration, release)
+            if release:
+                print_rank_0(f' loading release checkpoint from {load_dir}')
+            else:
+                print_rank_0(f' loading checkpoint from {load_dir} at iteration {iteration}')
 
     # Load the checkpoint.
     try:
+        print_with_rank(f"load checkpoint from {checkpoint_name}")
         state_dict = torch.load(checkpoint_name, map_location='cpu')
     except ModuleNotFoundError:
         from megatron.fp16_deprecated import loss_scaler
@@ -405,7 +432,7 @@ def _load_base_checkpoint(load_dir, rank0=False):
         sys.modules.pop('fp16.loss_scaler', None)
         sys.modules.pop('megatron.fp16.loss_scaler', None)
     except BaseException as e:
-        print_rank_0('could not load the checkpoint')
+        print_rank_0(f'could not load the checkpoint from {checkpoint_name}')
         print_rank_0(e)
         sys.exit()
 

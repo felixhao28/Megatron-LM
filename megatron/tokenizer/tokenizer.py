@@ -27,9 +27,12 @@ def build_tokenizer(args):
                                             lower_case=False,
                                             vocab_extra_ids=args.vocab_extra_ids)
     elif args.tokenizer_type == 'GPT2BPETokenizer':
-        assert args.vocab_file is not None
-        assert args.merge_file is not None
-        tokenizer = _GPT2BPETokenizer(args.vocab_file, args.merge_file)
+        if args.vocab_file is None or args.merge_file is None:
+            tokenizer = None
+        else:
+            assert args.vocab_file is not None
+            assert args.merge_file is not None
+            tokenizer = _GPT2BPETokenizer(args.vocab_file, args.merge_file)
     elif args.tokenizer_type == 'SentencePieceTokenizer':
         assert args.tokenizer_model is not None
         tokenizer = _SentencePieceTokenizer(args.tokenizer_model, vocab_extra_ids=args.vocab_extra_ids)
@@ -44,7 +47,8 @@ def build_tokenizer(args):
                                   'implemented.'.format(args.tokenizer_type))
     
     # Add vocab size.
-    args.padded_vocab_size = _vocab_size_with_padding(tokenizer.vocab_size,
+    vocab_size = tokenizer.vocab_size if tokenizer is not None else args.vocab_size
+    args.padded_vocab_size = _vocab_size_with_padding(vocab_size,
                                                       args)
 
     return tokenizer

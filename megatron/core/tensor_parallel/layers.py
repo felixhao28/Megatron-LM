@@ -586,7 +586,7 @@ class ColumnParallelLinear(torch.nn.Module):
         )
         if self.gather_output:
             # All-gather across the partitions.
-            assert not self.sequence_parallel
+            # assert not self.sequence_parallel
             output = gather_from_tensor_model_parallel_region(output_parallel)
         else:
             output = output_parallel

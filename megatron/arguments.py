@@ -592,6 +592,8 @@ def _add_network_size_args(parser):
                        help='Untie embeddings and output weights.'),
     group.add_argument('--embedding-weights-in-fp32', action='store_true',
                        help='Cast word embedding weights to fp32 before embedding fwd.'),
+    group.add_argument('--multi-query', action='store_true',
+                       help='Use multi query')
     return parser
 
 
@@ -911,6 +913,8 @@ def _add_checkpointing_args(parser):
                        help='Do not save current rng state.')
     group.add_argument('--load', type=str, default=None,
                        help='Directory containing a model checkpoint.')
+    group.add_argument('--no-strict-load', action='store_true',
+                       help='Ignore model loading errors')
     group.add_argument('--no-load-optim', action='store_true', default=None,
                        help='Do not load optimizer when loading checkpoint.')
     group.add_argument('--no-load-rng', action='store_true', default=None,
