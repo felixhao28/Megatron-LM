@@ -188,6 +188,24 @@ class IndexedDataset(torch.utils.data.Dataset):
             sents = np.split(a, offsets[:-1])
             return sents
 
+    def get(self, idx, offset=0, length=None):
+        """ Retrieves a single item from the dataset with the option to only
+        return a portion of the item.
+
+        get(idx) is the same as [idx] but get() does not support slicing.
+        """
+        if not self.data_file:
+            self.read_data(self.path)
+        i = idx
+        self.check_index(i)
+        if length is None:
+            tensor_size = self.sizes[self.dim_offsets[i]:self.dim_offsets[i + 1]]
+            length = tensor_size - offset
+        a = np.empty(length, dtype=self.dtype)
+        self.data_file.seek((self.data_offsets[i] + offset) * self.element_size)
+        self.data_file.readinto(a)
+        return a
+
     def __len__(self):
         return self._len
 

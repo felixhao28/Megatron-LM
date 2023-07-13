@@ -170,7 +170,12 @@ class Partition(object):
         for i, (doc, sentence_lens, bytes_processed) in enumerate(encoded_docs, start=1):
             total_bytes_processed += bytes_processed
             for key in doc.keys():
-                builders[key].add_doc(doc[key], sentence_lens[key])
+                builder = builders[key]
+                if hasattr(builder, 'add_doc'):
+                    builder.add_doc(doc[key], sentence_lens[key])
+                else:
+                    builder.add_item(torch.asarray(doc[key]))
+                    builder.end_document()
             self.print_processing_stats(i, proc_start, total_bytes_processed)
 
         fin.close()

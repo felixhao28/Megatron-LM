@@ -258,31 +258,21 @@ class CoreAttention(MegatronModule):
                        key_layer.size(0))
         b, np, sq, sk = output_size
 
+        # [sq, b, np, hn] -> [sq, b * np, hn]
+        query_layer = query_layer.view(output_size[2],
+                                       output_size[0] * output_size[1], -1)
         if self.multi_query:
-            # [sq, b, np, hn] -> [b, sq, np, hn]
-            query_layer = query_layer.transpose(0, 1)
-            # [sq, b, np, hn] -> [b, sq * np, hn]
-            query_layer = query_layer.view(b, sq * np, -1)
             # [sk, b, 1, hn] -> [sk, b, hn]
             key_layer = key_layer.view(sk, b, -1)
-            # [sk, b, hn] -> [b, hn, sk]
-            key_layer = key_layer.transpose(0, 1).transpose(1, 2)
 
             # preallocting input tensor: [b, sq * np, sk]
             matmul_input_buffer = mpu.get_global_memory_buffer().get_tensor(
-                (b, sq * np, sk),
+                (b, np * sq, sk),
                 query_layer.dtype, "mpu")
         else:
-            # [sq, b, np, hn] -> [sq, b * np, hn]
-            query_layer = query_layer.view(output_size[2],
-                                        output_size[0] * output_size[1], -1)
-            # [sq, b * np, hn] -> [b * np, sq, hn]
-            query_layer = query_layer.transpose(0, 1)
             # [sk, b, np, hn] -> [sk, b * np, hn]
             key_layer = key_layer.view(output_size[3],
                                     output_size[0] * output_size[1], -1)
-            # [sk, b * np, hn] -> [b * np, hn, sk]
-            key_layer = key_layer.transpose(0, 1).transpose(1, 2)
 
             # preallocting input tensor: [b * np, sq, sk]
             matmul_input_buffer = mpu.get_global_memory_buffer().get_tensor(
@@ -292,15 +282,9 @@ class CoreAttention(MegatronModule):
         # Raw attention scores. MHA: [b * np, sq, sk] MQA: [b, sq * np, sk]
         matmul_result = torch.baddbmm(
             matmul_input_buffer,
-            query_layer,   # MHA: [b * np, sq, hn] MQA: [b, sq * np, hn]
-            key_layer,     # MHA: [b * np, hn, sk] MQA: [b, hn, sk]
+            query_layer.transpose(0, 1),   # [sq, b * np, hn] -> [b * np, sq, hn]
+            key_layer.transpose(0, 1).transpose(1, 2),     # MHA: [sk, b * np, hn] -> [b * np, hn, sk] MQA: [sk, b, hn] -> [b, hn, sk]
             beta=0.0, alpha=(1.0/self.norm_factor))
-
-        if self.multi_query:
-            # [b, sq * np, sk] -> [b, sq, np, sk]
-            matmul_result = matmul_result.view(b, sq, np, sk)
-            # [b, sq, np, sk] -> [b, np, sq, sk]
-            matmul_result = matmul_result.transpose(1, 2)
 
         # change view to [b, np, sq, sk]
         attention_scores = matmul_result.view(*output_size)
@@ -338,14 +322,9 @@ class CoreAttention(MegatronModule):
         value_layer = value_layer.view(value_layer.size(0),
                                        value_layer.size(1) * value_layer.size(2), -1)
 
-        if self.multi_query:
-            # change view [b, np * sq, sk]
-            attention_probs = attention_probs.view(output_size[0], output_size[1] *
-                                                output_size[2], -1)
-        else:
-            # change view [b * np, sq, sk]
-            attention_probs = attention_probs.view(output_size[0] * output_size[1],
-                                                output_size[2], -1)
+        # change view [b * np, sq, sk]
+        attention_probs = attention_probs.view(output_size[0] * output_size[1],
+                                               output_size[2], -1)
 
         # matmul: MQA: [b, np * sq, hn] MHA: [b * np, sq, hn]
         context_layer = torch.bmm(attention_probs, value_layer.transpose(0, 1))
@@ -478,8 +457,6 @@ class ParallelAttention(MegatronModule):
                     init_method=config.init_method,
                     bias=args.add_bias_linear,
                     gather_output=False)
-                # 我不确定这是不是个好主意，因为hn在starcoder里面也就是 6144/48=128
-                # 把一个 6144 * 256 的小矩阵做模型并行可能意义不大，但影响应该也不大
                 self.key_value = tensor_parallel.ColumnParallelLinear(
                     config.hidden_size,
                     2 * self.hidden_size_per_attention_head, # 2 * 128
